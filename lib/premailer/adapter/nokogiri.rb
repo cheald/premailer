@@ -1,10 +1,9 @@
-require 'nokogiri'
+require "nokogiri"
 
 class Premailer
   module Adapter
     # Nokogiri adapter
     module Nokogiri
-
       include AdapterHelper::RgbToHex
       # Merge CSS into the HTML document.
       #
@@ -16,7 +15,7 @@ class Premailer
         # Give all styles already in style attributes a specificity of 1000
         # per http://www.w3.org/TR/CSS21/cascade.html#specificity
         doc.search("*[@style]").each do |el|
-          el['style'] = '[SPEC=1000[' + el.attributes['style'] + ']]'
+          el["style"] = "[SPEC=1000[#{el.attr("style")}]]"
         end
         # Iterate through the rules and merge them into the HTML
         @css_parser.each_selector(:all) do |selector, declaration, specificity, media_types|
@@ -25,6 +24,7 @@ class Premailer
 
           # Convert element names to lower case
           selector.gsub!(/([\s]|^)([\w]+)/) { |m| $1.to_s + $2.to_s.downcase }
+          block = "[SPEC=#{specificity}[#{declaration}]]"
 
           if Premailer.is_media_query?(media_types) || selector =~ Premailer::RE_UNMERGABLE_SELECTORS
             @unmergable_rules.add_rule_set!(CssParser::RuleSet.new(selector, declaration), media_types) unless @options[:preserve_styles]
@@ -41,10 +41,10 @@ class Premailer
               selector.gsub!(/\A\#([\w_\-]+)\Z/, '*[@id=\1]')
 
               doc.search(selector).each do |el|
-                if el.elem? and (el.name != 'head' and el.parent.name != 'head')
+                if el.elem? and (el.name != "head" and el.parent.name != "head")
                   # Add a style attribute or append to the existing one
-                  block = "[SPEC=#{specificity}[#{declaration}]]"
-                  el['style'] = (el.attributes['style'].to_s ||= '') + ' ' + block
+                  s = el.attr("style")
+                  el["style"] = s ? "#{s} #{block}" : block
                 end
               end
             rescue ::Nokogiri::SyntaxError, RuntimeError, ArgumentError
@@ -59,39 +59,68 @@ class Premailer
           doc.search("script").remove
         end
 
+        expansion_cache = {}
+        string_cache = {}
+        ruleset_keys = {}
+        attr_key_cache = {}
+
         # Read STYLE attributes and perform folding
         doc.search("*[@style]").each do |el|
-          style = el.attributes['style'].to_s
+          style = el.attr("style")
 
-          declarations = []
-          style.scan(/\[SPEC\=([\d]+)\[(.[^\]\]]*)\]\]/).each do |declaration|
-            rs = CssParser::RuleSet.new(nil, declaration[1].to_s, declaration[0].to_i)
-            declarations << rs
+          expansion_cache[style] ||= begin
+            declarations = []
+            style.scan(/\[SPEC\=([\d]+)\[(.[^\]\]]*)\]\]/).each do |declaration|
+              rs = CssParser::RuleSet.new(nil, declaration[1].to_s, declaration[0].to_i)
+              declarations << rs
+            end
+
+            # Perform style folding
+            merged = CssParser.merge(declarations)
+            merged.expand_shorthand!
+            merged.create_shorthand! if @options[:create_shorthands]
+            ruleset_keys[merged] = merged.instance_variable_get("@declarations").keys.map(&:downcase)
+            merged
           end
-
-          # Perform style folding
-          merged = CssParser.merge(declarations)
-          merged.expand_shorthand!
+          merged = expansion_cache[style]
 
           # Duplicate CSS attributes as HTML attributes
-          if Premailer::RELATED_ATTRIBUTES.has_key?(el.name) && @options[:css_to_attributes]
-            Premailer::RELATED_ATTRIBUTES[el.name].each do |css_att, html_att|
-              if el[html_att].nil? and not merged[css_att].empty?
-                new_html_att = merged[css_att].gsub(/url\(['"](.*)['"]\)/, '\1').gsub(/;$|\s*!important/, '').strip
-                el[html_att] = css_att.end_with?('color') && @options[:rgb_to_hex_attributes] ? ensure_hex(new_html_att) : new_html_att
+          name = el.name
+
+          # This is unholy, but the alternative is massive duplication
+          orig_decl = decl = merged.instance_variable_get("@declarations")
+          removed_attrs = []
+          if @options[:css_to_attributes] && Premailer::RELATED_ATTRIBUTES.has_key?(name)
+            attr_key_cache[name] = Premailer::RELATED_ATTRIBUTES[name].keys & ruleset_keys[merged]
+            attr_key_cache[name].each do |css_att|
+              html_att = Premailer::RELATED_ATTRIBUTES[name][css_att]
+              css_val = merged[css_att]
+              if el[html_att].nil? and not css_val.empty?
+                new_html_att = css_val.gsub(/url\(['"](.*)['"]\)/, '\1').gsub(/;$|\s*!important/, "").strip
+                new_val = @options[:rgb_to_hex_attributes] && css_att.end_with?("color") ? ensure_hex(new_html_att) : new_html_att
+                el[html_att] = new_val
               end
               unless @options[:preserve_style_attribute]
-                merged.instance_variable_get("@declarations").tap do |declarations|
-                    declarations.delete(css_att)
+                if removed_attrs.empty?
+                  decl = decl.dup
+                  merged.instance_variable_set("@declarations", decl)
                 end
+                removed_attrs << css_att
+                decl.delete css_att
               end
             end
           end
-          # Collapse multiple rules into one as much as possible.
-          merged.create_shorthand! if @options[:create_shorthands]
 
           # write the inline STYLE attribute
-          el['style'] = merged.declarations_to_s
+          key = style
+          if removed_attrs.empty?
+            string_cache[key] = merged.declarations_to_s
+          else
+            key = removed_attrs.join(";") + style
+            string_cache[key] ||= merged.declarations_to_s
+            merged.instance_variable_set("@declarations", orig_decl)
+          end
+          el["style"] = string_cache[key]
         end
 
         doc = write_unmergable_css_rules(doc, @unmergable_rules)
@@ -101,7 +130,7 @@ class Premailer
             if el.comment? and @options[:remove_comments]
               el.remove
             elsif el.element?
-              el.remove_attribute('class') if @options[:remove_classes]
+              el.remove_attribute("class") if @options[:remove_classes]
             end
           end
         end
@@ -110,24 +139,24 @@ class Premailer
           # find all anchor's targets and hash them
           targets = []
           doc.search("a[@href^='#']").each do |el|
-            target = el.get_attribute('href')[1..-1]
+            target = el.get_attribute("href")[1..-1]
             targets << target
-            el.set_attribute('href', "#" + Digest::MD5.hexdigest(target))
+            el.set_attribute("href", "#" + Digest::MD5.hexdigest(target))
           end
           # hash ids that are links target, delete others
           doc.search("*[@id]").each do |el|
-            id = el.get_attribute('id')
+            id = el.get_attribute("id")
             if targets.include?(id)
-              el.set_attribute('id', Digest::MD5.hexdigest(id))
+              el.set_attribute("id", Digest::MD5.hexdigest(id))
             else
-              el.remove_attribute('id')
+              el.remove_attribute("id")
             end
           end
         end
 
         if @options[:reset_contenteditable]
-          doc.search('*[@contenteditable]').each do |el|
-            el.remove_attribute('contenteditable')
+          doc.search("*[@contenteditable]").each do |el|
+            el.remove_attribute("contenteditable")
           end
         end
 
@@ -155,15 +184,14 @@ class Premailer
             doc.add_child(style_tag)
           else
             style_tag = doc.create_element "style", "#{styles}"
-            head = doc.at_css('head')
-            head ||=  doc.root.first_element_child.add_previous_sibling(doc.create_element "head")  if doc.root && doc.root.first_element_child
-            head ||=  doc.add_child(doc.create_element "head")
+            head = doc.at_css("head")
+            head ||= doc.root.first_element_child.add_previous_sibling(doc.create_element "head") if doc.root && doc.root.first_element_child
+            head ||= doc.add_child(doc.create_element "head")
             head << style_tag
           end
         end
         doc
       end
-
 
       # Converts the HTML document to a format suitable for plain-text e-mail.
       #
@@ -171,10 +199,10 @@ class Premailer
       #
       # @return [String] a plain text.
       def to_plain_text
-        html_src = ''
+        html_src = ""
         begin
           html_src = @doc.at("body").inner_html
-        rescue;
+        rescue
         end
 
         html_src = @doc.to_html unless html_src and not html_src.empty?
@@ -191,6 +219,10 @@ class Premailer
         end
       end
 
+      def is_xhtml?
+        @doc.internal_subset.system_id && @doc.internal_subset.system_id.match(/xhtml/i)
+      end
+
       # Load the HTML file and convert it into an Nokogiri document.
       #
       # @return [::Nokogiri::XML] a document.
@@ -202,7 +234,7 @@ class Premailer
           thing = input
         elsif @is_local_file
           @base_dir = File.dirname(input)
-          thing = File.open(input, 'r')
+          thing = File.open(input, "r")
         else
           thing = open(input)
         end
@@ -223,16 +255,16 @@ class Premailer
         # Default encoding is ASCII-8BIT (binary) per http://groups.google.com/group/nokogiri-talk/msg/0b81ef0dc180dc74
         # However, we really don't want to hardcode this. ASCII-8BIT should be the default, but not the only option.
         encoding = if thing.is_a?(String) and RUBY_VERSION =~ /1.9/
-          thing = thing.force_encoding(@options[:input_encoding]).encode!
-          @options[:input_encoding]
-        else
-          @options[:input_encoding] || (RUBY_PLATFORM == 'java' ? nil : 'BINARY')
-        end
+                     thing = thing.force_encoding(@options[:input_encoding]).encode!
+                     @options[:input_encoding]
+                   else
+                     @options[:input_encoding] || (RUBY_PLATFORM == "java" ? nil : "BINARY")
+                   end
         doc = if @options[:html_fragment]
-          ::Nokogiri::HTML.fragment(thing, encoding)
-        else
-          ::Nokogiri::HTML(thing, nil, encoding) { |c| c.recover }
-        end
+                ::Nokogiri::HTML.fragment(thing, encoding)
+              else
+                ::Nokogiri::HTML(thing, nil, encoding) { |c| c.recover }
+              end
 
         # Fix for removing any CDATA tags from both style and script tags inserted per
         # https://github.com/sparklemotion/nokogiri/issues/311 and
@@ -245,7 +277,6 @@ class Premailer
 
         doc
       end
-
     end
   end
 end
